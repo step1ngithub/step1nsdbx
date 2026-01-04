@@ -21,7 +21,7 @@ step1nsdbx a.k.a. setting up and launching a [jailed](https://github.com/firecra
    - [Optional] Create a dedicated low-privilege user for Firecracker and add it to the `kvm` group for access to `/dev/kvm`:
      ```bash
      POLP="step1nsdbx"
-     sudo adduser --system --group "$POLP" --shell /bin/false --home /var/lib/"$POLP"
+     sudo adduser --system --group "$POLP" --shell /bin/false --home "/var/lib/${POLP}"
      sudo usermod -aG kvm "$POLP"
      ```
    - Verify KVM access:
@@ -54,15 +54,16 @@ step1nsdbx a.k.a. setting up and launching a [jailed](https://github.com/firecra
 > Review also firecracker team's [prod setup guidelines](https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md).
 
 ## Installation
-
+```bash
+mkdir "${POLP}-build-dir"
+cd "${POLP}-build-dir"
+ARCH="$(uname -m)"
+release_url="https://github.com/firecracker-microvm/firecracker/releases"
+latest_version=$(basename $(curl -fsSLI -o /dev/null -w  %{url_effective} ${release_url}/latest))
+```
 1. **Download Firecracker Binaries:**
    - Download the latest binary release:
      ```bash
-     mkdir "${POLP}-build-dir"
-     cd "${POLP}-build-dir"
-     ARCH="$(uname -m)"
-     release_url="https://github.com/firecracker-microvm/firecracker/releases"
-     latest_version=$(basename $(curl -fsSLI -o /dev/null -w  %{url_effective} ${release_url}/latest))
      curl -LO https://github.com/firecracker-microvm/firecracker/releases/download/$latest_version/firecracker-$latest_version-$ARCH.tgz
      ```
    - Extract the Firecracker and Jailer binaries:
@@ -92,7 +93,7 @@ Firecracker requires a Linux kernel image and a root filesystem (rootfs) for the
    - First, let's set up a TAP interface on the Host to prepare acess via network since the serial will be disabled for the guest VM:
      ```bash
      # Guest VM internet access
-     TAP_DEV="tap0"
+     TAP_DEV="sdbx-tap0"
      TAP_NET="172.16.42"
      MASK_SHORT="/30"
      ## Create the tap device
@@ -100,18 +101,7 @@ Firecracker requires a Linux kernel image and a root filesystem (rootfs) for the
      ## Assign it the tap IP and start up the device
      sudo ip addr add "${TAP_NET}.1${MASK_SHORT}" dev "$TAP_DEV"
      sudo ip link set "$TAP_DEV" up
-     
-     # Guest VM access via network
-     BR_IF="br0"
-     BR_NET="172.16.243"
-     LOCAL_MASK="/29"
-     ## Create the bridge interface
-     sudo ip link add name "$BR_IF" type bridge
-     ## Add the above tap device to the bridge
-     sudo ip link set dev "$TAP_DEV" master "$BR_IF"
-     ## Give the bridge an IP address in its subnet pool
-     sudo ip address add "${BR_NET}.1${LOCAL_MASK}" dev "$BR_IF"
-     sudo ip link set "$BR_IF" up
+     ip a show "$TAP_DEV"
      ```
    - Setup the host system to [correctly route packet](https://github.com/firecracker-microvm/firecracker/blob/main/docs/network-setup.md) for the guest VM:
      ```bash
@@ -119,58 +109,55 @@ Firecracker requires a Linux kernel image and a root filesystem (rootfs) for the
      echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward
      # Host firewall rule
      HOST_IFACE=$(ip -j route list default |jq -r '.[0].dev')
-     ##
+     ## nftables for NAT on postrouting stage & filtering on foward stage
      sudo nft add table firecracker
      sudo nft 'add chain firecracker postrouting { type nat hook postrouting priority srcnat; policy accept; }'
      sudo nft 'add chain firecracker filter { type filter hook forward priority filter; policy accept; }'
      ## Guest IP masquerade
      sudo nft add rule firecracker postrouting ip saddr "${TAP_NET}.2" oifname "$HOST_IFACE" counter masquerade
-     ## Accecpt pkt from tap and redirect to host main net interface
+     ## Accept pkt from tap and redirect to host main net interface
      sudo nft add rule firecracker filter iifname "$TAP_DEV" oifname "$HOST_IFACE" accept
-
-     ## Bridge FW conf: allow traffic to be routed to the guest
-     sudo nft add rule firecracker postrouting oifname "$BR_IF" counter masquerade
      ```
    - Build a custom rootfs (e.g., with additional packages):
      - Mount the rootfs:
        ```bash
+       # Build an ubuntu Noble fs
        sudo apt install -y debootstrap
-       mkdir mnt rootfs
-       sudo debootstrap --variant=minbase --include=apt,sudo,netplan.io,vim,openssh-server,ufw plucky rootfs https://archive.ubuntu.com/ubuntu/
+       mkdir sdbx-mnt-rootfs tmp-rootfs
+       sudo debootstrap --variant=minbase --include=apt,adduser noble tmp-rootfs https://archive.ubuntu.com/ubuntu/
+       # Create an empty fs on an empty 1GiB file
        dd if=/dev/zero of=sdbx_rootfs.ext4 bs=1M count=1024
        mkfs.ext4 sdbx_rootfs.ext4
-       sudo mount -o loop sdbx_rootfs.ext4 mnt
+       # Mount the new fs to easily access its contents
+       sudo mount sdbx_rootfs.ext4 sdbx-mnt-rootfs
+       # Copy my custom fs to the mounting point
+       sudo cp -a tmp-rootfs/* sdbx-mnt-rootfs/
+       # Mount the devices
+       sudo mount -t proc /proc sdbx-mnt-rootfs/proc
+       sudo mount -t sysfs /sys sdbx-mnt-rootfs/sys
+       sudo mount -t devpts /dev/pts sdbx-mnt-rootfs/dev/pts
+       # Generate ssh key for ssh access into the guest VM
        ssh-keygen -t ed25519 -f sdbx_sk -N ""
-       sudo mkdir -p rootfs/root/.ssh
-       sudo cp -v sdbx_sk.pub rootfs/root/.ssh/authorized_keys
-       sudo bash -c 'echo "hardened-sdbx" > rootfs/etc/hostname'
-       sudo cp -a rootfs/* mnt/
-       sudo chroot mnt
+       sudo mkdir -p sdbx-mnt-rootfs/root/.ssh
+       sudo cp -v sdbx_sk.pub sdbx-mnt-rootfs/root/.ssh/authorized_keys
+       sudo bash -c 'echo "hardened-sdbx" > sdbx-mnt-rootfs/etc/hostname'
+       # Chroot in the guest file system to install packages, add no-root users, etc.
+       sudo chroot sdbx-mnt-rootfs
        ```
      - Inside chroot, install packages:
-         - Update and upgrade: `apt update && apt upgrade -y && apt modernize-sources -y`
-         - Install essential hardening tools (minimal): `apt install --no-install-recommends -y adduser apparmor`
-         - Disable unnecessary services: `systemctl disable --now avahi-daemon cups systemd-resolved`
-         - Enable firewall: `ufw --force enable && ufw default deny incoming && ufw allow from 172.16.42.1` (allow host IP)
+         - Update and upgrade: `apt update && apt upgrade -y`
+         - Install essential tools (minimal): `apt install --no-install-recommends -y openssh-server ufw`
+         - Enable firewall and allow ssh from host: `ufw enable && ufw allow from 172.16.42.1 to any port 22 proto tcp && ufw default deny incoming`
          - Create non-root user: `adduser --disabled-password zoba && usermod -aG sudo zoba && echo "zoba:s7r0ngp4ssw0rd" | chpasswd`
-         - DNS configuration: `echo "nameserver 8.8.8.8" >> /etc/resolv.conf`
-         - Kernel hardening: Edit `/etc/sysctl.conf` and add:
-           ```
-           kernel.kptr_restrict=2
-           kernel.dmesg_restrict=1
-           net.ipv4.conf.all.rp_filter=1
-           net.ipv4.conf.default.rp_filter=1
-           net.ipv4.tcp_syncookies=1
-           ```
-           Apply: `sysctl -p`
-         - Enable SSH for tunneling: `systemctl enable ssh && ufw allow 22/tcp`
-         - Enable AppArmor: `systemctl enable apparmor && aa-enforce /etc/apparmor.d/*`
-         - Remove root password (for autologin; set strong one in production): `passwd -d root`
+         - DNS configuration: `echo "nameserver 8.8.8.8" > /etc/resolv.conf`
          - Clean up: `apt autoremove --purge -y && rm -rf /var/cache/apt/*`
          - Exit chroot: `exit`
      - Out of chroot, unmount, and set read-only if desired and for immutability:
        ```bash
-       sudo umount mnt
+       sudo umount sdbx-mnt-rootfs/proc
+       sudo umount sdbx-mnt-rootfs/sys
+       sudo umount sdbx-mnt-rootfs/dev/pts
+       sudo umount sdbx-mnt-rootfs
        chmod 444 sdbx_rootfs.ext4
        ```
 
@@ -183,27 +170,27 @@ Using the Jailer to launch Firecracker in a secured environment applies chroot, 
      ```bash
      SDBXID="sdbx-$(uuidgen -r)"
      sudo mkdir -p "/srv/jailer/firecracker/$SDBXID/root" "/sys/fs/cgroup/firecracker/$SDBXID"
-     sudo cp sdbx_kernel.bin sdbx_rootfs.ext4 "/srv/jailer/firecracker/$SDBXID/root/"
+     # Move the kernel and rootfs to the chroot directory
+     sudo mv sdbx_kernel.bin sdbx_rootfs.ext4 "/srv/jailer/firecracker/$SDBXID/root/"
      sudo chown -R "$POLP":"$POLP" "/srv/jailer/firecracker/$SDBXID/root" "/sys/fs/cgroup/firecracker/$SDBXID"
-     # cleaning
-     rm sdbx_kernel.bin sdbx_rootfs.ext4 sdbx_sk.pub
-     rmdir mnt
-     sudo rm -rf rootfs
+     # Cleaning
+     rmdir sdbx-mnt-rootfs
+     sudo rm -rf tmp-rootfs
      ```
 
 2. **VM Configuration file** (sdbx_config.json content):
    - Set boot source (kernel)
    - Attach root drive (read-only for security)
-   - Set machine config (1 vCPU, 1024 MiB RAM)
+   - Set machine config (2 vCPU, 1024 MiB RAM)
    - Configure network
    ```bash
    sudo -u "$POLP" bash -c "cat -> /srv/jailer/firecracker/$SDBXID/root/sdbx_config.json"
    ```
-   ```json
+   ```bash
    {
      "boot-source": {
-       "kernel_image_path": "sdbx_kernel.bin",
-       "boot_args": "8250.nr_uarts=0 reboot=k panic=1 pci=off ip=172.16.42.2::172.16.42.1:255.255.255.252::eth0:on",
+       "kernel_image_path": "./sdbx_kernel.bin",
+       "boot_args": "reboot=k panic=1 8250.nr_uarts=0 ip=172.16.42.2::172.16.42.1:255.255.255.252::eth0:off",
        "initrd_path": null
      },
      "drives": [
@@ -213,7 +200,7 @@ Using the Jailer to launch Firecracker in a secured environment applies chroot, 
          "is_root_device": true,
          "is_read_only": true,
          "cache_type": "Writeback",
-         "path_on_host": "sdbx_rootfs.ext4",
+         "path_on_host": "./sdbx_rootfs.ext4",
          "io_engine": "Sync",
          "rate_limiter": {
             "bandwidth": {
@@ -230,7 +217,7 @@ Using the Jailer to launch Firecracker in a secured environment applies chroot, 
        }
      ],
      "machine-config": {
-       "vcpu_count": 1,
+       "vcpu_count": 2,
        "mem_size_mib": 1024,
        "smt": false,
        "track_dirty_pages": false,
@@ -240,7 +227,7 @@ Using the Jailer to launch Firecracker in a secured environment applies chroot, 
        {
          "iface_id": "eth0",
          "guest_mac": "00:16:3E:42:DE:AD",
-         "host_dev_name": "tap0",
+         "host_dev_name": "sdbx-tap0",
          "rx_rate_limiter": {
              "bandwidth": {
                  "size": 1024,
@@ -284,8 +271,9 @@ Using the Jailer to launch Firecracker in a secured environment applies chroot, 
          --new-pid-ns \
          --daemonize \
          -- \
-         --level debug \
          --log-path "./sdbx_firecracker.log" \
+         --level debug \
+         --show-level \
          --config-file "./sdbx_config.json"
      ```
      - This runs Firecracker jailed (non-root UID/GID, seccomp), with resource limits to prevent DoS (cgroups)
@@ -314,6 +302,7 @@ Using the Jailer to launch Firecracker in a secured environment applies chroot, 
      ```
    - Shutdown: From guest or API.
      ```bash
+     # From the guest just `reboot`
      # API soft shutdown
      sudo -u $POLP bash -c "curl --unix-socket /srv/jailer/firecracker/$SDBXID/root/run/firecracker.socket -i \
         -X PUT 'http://localhost/actions' \
@@ -365,7 +354,7 @@ Using the Jailer to launch Firecracker in a secured environment applies chroot, 
 ```bash
 sudo cat /srv/jailer/firecracker/$SDBXID/root/sdbx_firecracker.log
 sudo pkill -9 firecracker
-sudo rm /srv/jailer/firecracker/$SDBXID/root/run/firecracker.socket
+sudo rm /srv/jailer/firecracker/$SDBXID/root/run/firecracker.socket /srv/jailer/firecracker/$SDBXID/root/sdbx_firecracker.log
 sudo rm -rf /srv/jailer/firecracker/$SDBXID/root/dev
 ```
 
@@ -373,16 +362,15 @@ sudo rm -rf /srv/jailer/firecracker/$SDBXID/root/dev
 1. Network
    ```
    sudo ip link del "$TAP_DEV"
-   sudo ip link del "$BR_IF"
    sudo nft -a list ruleset
-   sudo nft delete rule firecracker postrouting handle 1
-   sudo nft delete rule firecracker filter handle 2
+   # sudo nft delete rule firecracker postrouting handle 1
+   # sudo nft delete rule firecracker filter handle 2
    sudo nft delete table firecracker
    ```
 2. System
    ```
    # If you have no more guests running on the host
    echo 0 | sudo tee /proc/sys/net/ipv4/ip_forward
-   # Clear the building directory
-   cd .. && rmdir "${POLP}-build-dir"
+   # Clear Building directory & Firecracker chroot env
+   cd .. && sudo rm -rf "${POLP}-build-dir" "/srv/jailer/firecracker/$SDBXID"
    ```
